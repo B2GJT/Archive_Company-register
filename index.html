@@ -1,0 +1,353 @@
+(async () => {
+  /**
+   * LMS Admin - 고객 관리 기업 일괄 추가 스크립트 (중복 등록 방지 수정 버전)
+   */
+
+  const CONFIG = {
+    WAIT_MODAL_MS: 1200,
+    AFTER_INPUT_WAIT_MS: 400,
+    AFTER_CLICK_WAIT_MS: 600,
+    SUBMIT_WAIT_MS: 1500,
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const normalize = (val) => String(val ?? "").trim();
+
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  };
+
+  const isDisabled = (el) => {
+    if (!el) return true;
+    return el.disabled === true || el.getAttribute("disabled") !== null || el.getAttribute("aria-disabled") === "true";
+  };
+
+  async function waitFor(getter, timeoutMs = 10000, label = "요소") {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const result = typeof getter === "function" ? getter() : getter;
+      if (result) return result;
+      await sleep(100);
+    }
+    throw new Error(`대기 시간 초과: ${label}`);
+  }
+
+  // 🎯 중복 클릭 방지 단일 클릭 함수
+  function safeClick(el) {
+    if (!el) return false;
+    el.scrollIntoView({ block: "center", inline: "center" });
+    try { el.focus?.(); } catch {}
+    
+    // 이벤트 중첩 호출 없이 단일 클릭만 실행
+    if (typeof el.click === "function") {
+      el.click();
+    } else {
+      const opts = { bubbles: true, cancelable: true, view: window };
+      el.dispatchEvent(new MouseEvent("click", opts));
+    }
+    return true;
+  }
+
+  function setReactValue(el, value) {
+    if (!el) return;
+    try { el.focus?.(); } catch {}
+
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+    const prevVal = el.value;
+    
+    if (descriptor?.set) {
+      descriptor.set.call(el, value);
+    } else {
+      el.value = value;
+    }
+    
+    const tracker = el._valueTracker;
+    if (tracker) tracker.setValue(prevVal);
+    
+    ['focus', 'input', 'change', 'blur'].forEach(evtName => {
+      el.dispatchEvent(new Event(evtName, { bubbles: true }));
+    });
+  }
+
+  function createModal() {
+    return new Promise((resolve, reject) => {
+      const existing = document.getElementById("__company_bulk_add_modal__");
+      if (existing) existing.remove();
+
+      const overlay = document.createElement("div");
+      overlay.id = "__company_bulk_add_modal__";
+      overlay.style.cssText = "position:fixed; inset:0; z-index:2147483647; background:rgba(15,23,42,0.55); display:flex; align-items:center; justify-content:center; font-family:sans-serif;";
+
+      const box = document.createElement("div");
+      box.style.cssText = "width:min(720px, calc(100vw - 48px)); background:white; color:#0f172a; border-radius:16px; box-shadow:0 24px 80px rgba(0,0,0,0.3); padding:24px;";
+      box.innerHTML = `
+        <h2 style="font-size:20px; font-weight:700; margin:0 0 8px;">🏢 기업 일괄 추가 도구</h2>
+        <p style="font-size:13px; line-height:1.5; margin:0 0 12px; color:#475569;">
+          엑셀에서 아래 순서대로 8개 컬럼 영역을 복사(Ctrl+C)하여 붙여넣으세요.<br/>
+          <code>사업자등록번호 | 기업명 | 대표자명 | 전화번호 | 주소 | 기업형태 | 업종 | 대표자 이메일</code>
+        </p>
+        <textarea id="__company_input_text__" spellcheck="false" style="width:100%; min-height:220px; border:1px solid #cbd5e1; border-radius:10px; padding:12px; font-family:monospace; font-size:12px; resize:vertical; outline:none;" placeholder="예시:\n123-45-67890\t주식회사 인사이트에이아이\t홍길동\t02-123-4567\t서울시 강남구\t중소기업\tIT\tsteve@insightai.art"></textarea>
+        <div style="margin-top:12px; display:flex; align-items:center; gap:8px;">
+          <input id="__company_test_mode__" type="checkbox" checked />
+          <label for="__company_test_mode__" style="font-size:13px; color:#334155; cursor:pointer;">테스트 모드: 첫 번째 기업 1개만 등록해보고 중단</label>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:20px;">
+          <button id="__btn_cancel__" style="border:1px solid #cbd5e1; background:white; padding:8px 16px; border-radius:8px; cursor:pointer; font-weight:600;">취소</button>
+          <button id="__btn_start__" style="background:#2563eb; color:white; border:none; padding:8px 16px; border-radius:8px; cursor:pointer; font-weight:700;">일괄 등록 시작</button>
+        </div>
+      `;
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+
+      box.querySelector("#__btn_cancel__").addEventListener("click", () => { overlay.remove(); reject(new Error("사용자 취소")); });
+      box.querySelector("#__btn_start__").addEventListener("click", () => {
+        const text = box.querySelector("#__company_input_text__").value.trim();
+        if (!text) { alert("데이터를 입력해주세요."); return; }
+
+        const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const dataList = [];
+
+        for (const line of lines) {
+          const cols = line.split("\t");
+          if (cols.length >= 2) {
+            dataList.push({
+              bizNo: normalize(cols[0]),
+              companyName: normalize(cols[1]),
+              ceoName: normalize(cols[2]),
+              phone: normalize(cols[3]),
+              address: normalize(cols[4]),
+              companyType: normalize(cols[5]),
+              industry: normalize(cols[6]),
+              ceoEmail: normalize(cols[7]),
+            });
+          }
+        }
+
+        if (dataList.length === 0) {
+          alert("유효한 데이터 형식이 아닙니다.");
+          return;
+        }
+
+        const testMode = box.querySelector("#__company_test_mode__").checked;
+        overlay.remove();
+        resolve({ dataList, testMode });
+      });
+    });
+  }
+
+  function findAddCompanyButton() {
+    return [...document.querySelectorAll("button, a")].filter(isVisible).find(el => {
+      if (el.closest("#__company_bulk_add_modal__")) return false;
+      const txt = normalize(el.innerText);
+      return txt === "기업 추가" || txt === "+ 기업 추가" || (txt.includes("기업") && txt.includes("추가"));
+    });
+  }
+
+  function findRealModalContainer() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].filter(isVisible);
+    const validDialog = dialogs.find(d => d.id !== "__company_bulk_add_modal__" && !d.closest("#__company_bulk_add_modal__"));
+    if (validDialog) return validDialog;
+
+    const modalLikes = [...document.querySelectorAll("div, section")].filter(el => {
+      if (!isVisible(el)) return false;
+      if (el.id === "__company_bulk_add_modal__" || el.closest("#__company_bulk_add_modal__")) return false;
+      
+      const style = window.getComputedStyle(el);
+      const isFixed = style.position === "fixed" || style.position === "absolute";
+      const zIndex = parseInt(style.zIndex, 10) || 0;
+      const txt = el.innerText || "";
+      const hasMainSearch = el.querySelector('input[placeholder*="검색"]');
+      
+      return isFixed && zIndex > 10 && !hasMainSearch && (txt.includes("사업자등록번호") || txt.includes("기업명") || txt.includes("대표자"));
+    });
+
+    return modalLikes[modalLikes.length - 1] || null;
+  }
+
+  function findInputField(container, keywords) {
+    const inputs = [...container.querySelectorAll("input, textarea, select")].filter(isVisible);
+
+    for (const input of inputs) {
+      const attrStr = [
+        input.name, input.id, input.placeholder,
+        input.getAttribute("data-testid"), input.getAttribute("aria-label"),
+        input.className, input.type
+      ].join(" ").toLowerCase();
+
+      if (keywords.some(k => attrStr.includes(k.toLowerCase()))) {
+        return input;
+      }
+    }
+
+    const labels = [...container.querySelectorAll("label, span, div, td, th, p")].filter(el => isVisible(el));
+    for (const label of labels) {
+      const txt = normalize(label.innerText);
+      if (keywords.some(k => txt.includes(k))) {
+        let parent = label.parentElement;
+        for (let i = 0; i < 4 && parent; i++) {
+          const input = parent.querySelector("input, textarea, select");
+          if (input && isVisible(input)) return input;
+          parent = parent.parentElement;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async function fillBizNoField(modal, bizNoValue) {
+    if (!bizNoValue) return;
+
+    const rawDigits = bizNoValue.replace(/[^0-9]/g, "");
+    const formattedWithHyphen = rawDigits.length === 10
+      ? `${rawDigits.slice(0, 3)}-${rawDigits.slice(3, 5)}-${rawDigits.slice(5)}`
+      : bizNoValue;
+
+    const singleInput = findInputField(modal, [
+      "bizNo", "bizNum", "businessNumber", "businessRegistrationNumber",
+      "registrationNumber", "taxId", "crn", "licenseNumber", "사업자", "사업자등록번호", "사업자번호"
+    ]);
+
+    if (singleInput) {
+      const maxLen = singleInput.getAttribute("maxlength");
+      if (maxLen === "10") {
+        setReactValue(singleInput, rawDigits);
+      } else {
+        setReactValue(singleInput, formattedWithHyphen);
+      }
+      return;
+    }
+
+    if (rawDigits.length === 10) {
+      const part1 = rawDigits.slice(0, 3);
+      const part2 = rawDigits.slice(3, 5);
+      const part3 = rawDigits.slice(5);
+
+      const bizLabel = [...modal.querySelectorAll("label, span, div, td, th")].find(
+        el => isVisible(el) && (el.innerText.includes("사업자") || el.innerText.includes("등록번호"))
+      );
+
+      if (bizLabel) {
+        let parent = bizLabel.parentElement;
+        for (let i = 0; i < 3 && parent; i++) {
+          const nearInputs = [...parent.querySelectorAll("input")].filter(isVisible);
+          if (nearInputs.length >= 3) {
+            setReactValue(nearInputs[0], part1);
+            setReactValue(nearInputs[1], part2);
+            setReactValue(nearInputs[2], part3);
+            return;
+          }
+          parent = parent.parentElement;
+        }
+      }
+    }
+
+    console.warn(`  ⚠️ 필드 미감지: [사업자등록번호] (입력 시도 값: ${bizNoValue})`);
+  }
+
+  function findSaveButton(container) {
+    const buttons = [...container.querySelectorAll("button, a, input[type='submit']")].filter(isVisible);
+    const filtered = buttons.filter(b => {
+      const txt = normalize(b.innerText || b.value);
+      return !txt.includes("취소") && !txt.includes("닫기") && !txt.includes("삭제");
+    });
+
+    const target = filtered.find(b => {
+      const txt = normalize(b.innerText || b.value);
+      return ["저장", "등록", "확인", "추가", "기업 추가", "기업 등록", "완료"].some(k => txt === k || txt.includes(k));
+    });
+
+    return target || filtered[filtered.length - 1] || null;
+  }
+
+  async function run() {
+    const { dataList, testMode } = await createModal();
+    console.log(`🚀 총 ${dataList.length}개 기업 일괄 등록 프로세스를 시작합니다...`);
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (let i = 0; i < dataList.length; i++) {
+      const item = dataList[i];
+      console.log(`\n[${i + 1}/${dataList.length}] 진행 중: ${item.companyName || item.bizNo}`);
+
+      try {
+        const addBtn = await waitFor(findAddCompanyButton, 8000, "기업 추가 버튼");
+        safeClick(addBtn);
+        await sleep(CONFIG.WAIT_MODAL_MS);
+
+        const modal = await waitFor(findRealModalContainer, 8000, "기업 추가 팝업 모달창");
+
+        // 1. 사업자등록번호 입력
+        await fillBizNoField(modal, item.bizNo);
+
+        // 2. 나머지 항목 입력
+        const fields = [
+          { name: "기업명", keys: ["companyName", "name", "기업명", "회사명"], val: item.companyName },
+          { name: "대표자명", keys: ["ceoName", "representative", "대표자명", "대표자"], val: item.ceoName },
+          { name: "전화번호", keys: ["phone", "tel", "전화번호", "대표전화", "연락처"], val: item.phone },
+          { name: "주소", keys: ["address", "주소"], val: item.address },
+          { name: "기업형태", keys: ["companyType", "type", "기업형태", "기업 분류", "형태"], val: item.companyType },
+          { name: "업종", keys: ["industry", "업종", "업태"], val: item.industry },
+          { name: "이메일", keys: ["email", "ceoEmail", "mail", "이메일", "대표자 이메일"], val: item.ceoEmail },
+        ];
+
+        for (const f of fields) {
+          if (!f.val) continue;
+          const inputEl = findInputField(modal, f.keys);
+          if (inputEl) {
+            setReactValue(inputEl, f.val);
+            await sleep(50);
+          } else {
+            console.warn(`  ⚠️ 필드 미감지: [${f.name}]`);
+          }
+        }
+
+        await sleep(CONFIG.AFTER_INPUT_WAIT_MS);
+
+        const saveBtn = findSaveButton(modal);
+        if (!saveBtn) {
+          throw new Error("저장/등록 버튼을 탐지하지 못했습니다.");
+        }
+        if (isDisabled(saveBtn)) {
+          throw new Error(`저장 버튼("${normalize(saveBtn.innerText)}")이 비활성화(disabled) 상태입니다.`);
+        }
+
+        // 3. 단일 클릭으로 저장 버튼 클릭
+        safeClick(saveBtn);
+        console.log(`  ✅ 저장 클릭 완료: ${item.companyName}`);
+        successCount++;
+
+        // 4. 모달창이 완전히 닫힐 때까지 대기하여 중단/중복 클릭 방지
+        await waitFor(() => !findRealModalContainer(), 6000, "팝업 닫힘").catch(() => {});
+        await sleep(CONFIG.SUBMIT_WAIT_MS);
+
+        if (testMode) {
+          alert(`[테스트 완료]\n첫 번째 기업(${item.companyName || item.bizNo})이 성공적으로 등록되었습니다.`);
+          return;
+        }
+
+      } catch (err) {
+        console.error(`  ❌ [실패] ${item.companyName || item.bizNo} 등록 오류:`, err.message);
+        failCount++;
+        
+        const cancelBtn = [...document.querySelectorAll("button")].find(b => isVisible(b) && (b.innerText.includes("취소") || b.innerText.includes("닫기")));
+        if (cancelBtn) safeClick(cancelBtn);
+        await sleep(800);
+      }
+    }
+
+    alert(`🎉 모든 기업 등록 작업이 완료되었습니다.\n\n- 성공: ${successCount}건\n- 실패: ${failCount}건`);
+  }
+
+  try {
+    await run();
+  } catch (e) {
+    console.log("작업이 취소되었거나 오류가 발생했습니다:", e.message);
+  }
+})();
